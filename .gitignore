@@ -1,0 +1,13 @@
+external/
+results/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.cache/
+.tmp/
+*.log
+slurm_*.out
+slurm_*.err
+.DS_Store
+.idea/
