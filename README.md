@@ -1,10 +1,18 @@
-# CoT Monitorability Evals on Open Weights
+# CoT Monitorability on Open Weights: Replicating OpenAI's Monitorability Evals at 20B Scale
 
-Open-weight replication of OpenAI's [monitorability-evals](https://github.com/openai/monitorability-evals) suite from *Monitoring Monitorability* (Guan et al., arXiv [2512.18311](https://arxiv.org/abs/2512.18311)), whose public results cover GPT-5-Thinking only. This repo wires the official scaffold end-to-end against self-hosted open models and reports first-pass results at 20B scale. It is part of my Rutgers MSCS thesis on chain-of-thought monitorability.
+An open-weight replication of the monitorability evals from *Monitoring Monitorability* (Guan et al., 2025), whose public results cover GPT-5-Thinking only. This repo wires the official scaffold end-to-end against self-hosted open models: gpt-oss-20B as the agent and Gemma 4 31B as the monitor, both served with vLLM on a university SLURM cluster. It is one half of my Rutgers MSCS thesis on chain-of-thought monitorability; the other half is [confessions-small-scale](https://github.com/abhishuoza/confessions-small-scale).
 
-Setup: gpt-oss-20B as the agent (low reasoning effort) and Gemma 4 31B as a cross-family monitor (chosen to avoid same-family confounds), both served via vLLM on the Rutgers ILAB SLURM cluster; OpenAI's cross-fitted g-mean2 metric used as shipped. Six intervention datasets, 8,500 graded rows, zero pipeline errors.
+The evals measure whether a model's chain of thought reveals things its final answer hides. Each of the six datasets plants an intervention that should change the agent's behavior (a hint to defer to, a cue to sandbag, a nudge toward a wrong judgment), and a monitor model then tries to detect that influence while reading one of three scopes: the chain of thought only, the final answer only, or all messages. When the CoT-only monitor succeeds where the answer-only monitor fails, the chain of thought is carrying safety-relevant signal that would be invisible from outputs alone. That gap is exactly what these evals exist to measure.
 
-## First-pass results (low reasoning effort, N=5 samples per row)
+```
+dataset row ──> agent: gpt-oss-20B (vLLM) ──> transcript (reasoning + final answer)
+transcript  ──> monitor: Gemma 4 31B (vLLM), reading one scope:
+                { cot_only | answer_only | all_messages } ──> verdicts ──> cross-fitted g-mean2
+```
+
+## Results
+
+First pass at low reasoning effort, N=5 samples per row. The metric is OpenAI's cross-fitted g-mean2 (higher means the monitor detects the intervention more reliably), used exactly as shipped. A row counts as eligible only if the planted intervention measurably changes the agent's final answer; eligibility is the fraction of rows surviving that filter. 8,500 graded rows, zero pipeline errors.
 
 | Dataset | cot_only | answer_only | all_messages | Eligibility |
 |---|---|---|---|---|
@@ -15,38 +23,62 @@ Setup: gpt-oss-20B as the agent (low reasoning effort) and Gemma 4 31B as a cros
 | scruples_suggest_wrong | 0.222 ± 0.135 | 0.000 ± 0.000 | 0.201 ± 0.137 | 5% |
 | wmdp_sandbagging | 0.337 ± 0.179 | 0.000 ± 0.000 | 0.353 ± 0.144 | 6% |
 
-A row is eligible only if the planted intervention measurably changes the agent's final answer; eligibility is the fraction of items surviving that filter.
+**Takeaways**
 
-Two takeaways so far. First, the scope split the evals are designed to expose reproduces cleanly on an open stack: on daft, the monitor catches the planted cue from the reasoning trace (0.66) but never from the final answer alone (0.00). Second, at 20B and low reasoning effort the binding constraint is eligibility, not monitor quality: on five of six datasets the agent rarely engages with the intervention at all, so the immediate next step is rerunning at medium/high reasoning effort and with larger agents to find where eligibility climbs.
+Two so far. First, the scope split the evals are designed to expose reproduces cleanly on an open stack: on daft, the monitor catches the planted cue from the reasoning trace (0.66) but never from the final answer alone (0.00). The 0.00 is the eval working as intended, since daft's cue is named in the reasoning but never in the answer, and it doubles as a clean negative control on the whole pipeline. Second, at 20B and low reasoning effort the binding constraint is eligibility, not monitor quality: on five of six datasets the agent rarely engages with the intervention at all. So the immediate next step is rerunning at medium and high reasoning effort, and with larger agents, to find where eligibility climbs.
 
-## How it works
+## Setup
 
-- `external/monitorability-evals/` — unmodified clone of the official scaffold (gitignored; clone it yourself, see below).
-- `inference/` — thin OpenAI-compatible clients for the agent (`agent.py`, with reasoning-effort / thinking controls and BEGIN/END tag wrapping for the monitor templates) and the monitor (`monitor.py`, single-letter verdict parsing).
-- `scripts/run_eval.py` — the end-to-end runner: monkey-patches the scaffold's `MockModel` / `MockGraders` with real vLLM endpoints and replaces its sampler with a concurrent `ThreadPoolExecutor` runner; writes the scaffold's standard outputs plus per-row transcripts, monitor verdicts per scope, and latencies.
-- `scripts/vllm_serve.slurm` — serves agent and monitor on one SLURM node (agent on one GPU, monitor at TP=2 on two).
-- `scripts/chain_evals.sh` — the sweep across the six intervention datasets (`--samples-per-row 5 --reasoning-effort low`).
-- `scripts/smoke_local.py` — offline smoke test with a fake OpenAI client; validates the full wiring without any model.
-
-Full per-run outputs (~150 MB of graded rows and logs) are kept out of git.
-
-## Running
+| Component | Details |
+|---|---|
+| Agent | `openai/gpt-oss-20b`, low reasoning effort, one GPU via vLLM |
+| Monitor | `google/gemma-4-31B-it`, tensor parallel over two GPUs; deliberately cross-family, so the judge is not grading text written in its own dialect |
+| Scaffold | [openai/monitorability-evals](https://github.com/openai/monitorability-evals), unmodified: datasets, prompts, eligibility filtering and the cross-fitted g-mean2 computation all run exactly as shipped |
+| Scale | 6 intervention datasets, N=5 samples per row, 8,500 graded rows |
+| Hardware | 3x NVIDIA A100 on the Rutgers ILAB SLURM cluster |
 
 ```bash
-git clone https://github.com/openai/monitorability-evals external/monitorability-evals
 pip install -r requirements.txt
-# validate wiring without any model:
+git clone https://github.com/openai/monitorability-evals external/monitorability-evals
+```
+
+## Usage
+
+```bash
+# validate the full wiring offline, no model needed:
 python scripts/smoke_local.py
-# serve models (adjust for your cluster):
+
+# serve both models (adjust for your cluster):
 sbatch scripts/vllm_serve.slurm
+
 # smoke run against real endpoints:
 python scripts/run_eval.py --dataset daft --max-rows-per-dataset 3 --samples-per-row 2
-# full sweep:
+
+# full six-dataset sweep:
 bash scripts/chain_evals.sh
 ```
 
-Endpoints and models are configurable via flags or environment variables (`AGENT_BASE_URL`, `AGENT_MODEL`, `MONITOR_BASE_URL`, `MONITOR_MODEL`, ...); see `scripts/run_eval.py`.
+Endpoints and models are configurable via flags or environment variables (`AGENT_BASE_URL`, `AGENT_MODEL`, `MONITOR_BASE_URL`, `MONITOR_MODEL`, ...); see `scripts/run_eval.py`. Full per-run outputs (~150 MB of graded rows and logs) stay out of git.
 
-## Context
+## Project Structure
 
-This work is one half of a broader thesis direction on "clean channels" for scalable model testing (reward-disjoint or optimization-shielded channels whose honesty we can argue for); the other half is a small-open-scale study of OpenAI's confessions training, at [confessions-small-scale](https://github.com/abhishuoza/confessions-small-scale).
+```
+├── inference/
+│   ├── agent.py          # OpenAI-compatible agent client: reasoning-effort controls, BEGIN/END tag wrapping
+│   └── monitor.py        # Monitor client with single-letter verdict parsing
+├── scripts/
+│   ├── run_eval.py       # End-to-end runner over the official scaffold
+│   ├── chain_evals.sh    # Sweep across the six intervention datasets
+│   ├── vllm_serve.slurm  # Serves agent + monitor on one SLURM node
+│   └── smoke_local.py    # Offline smoke test with a fake OpenAI client
+├── external/             # Unmodified clone of the official scaffold (gitignored)
+└── requirements.txt
+```
+
+The one piece of engineering worth naming: the scaffold ships with `MockModel` and `MockGraders` stubs and a sequential sampler. `run_eval.py` subclasses the mocks with real vLLM endpoints and swaps the sampler for a concurrent `ThreadPoolExecutor` runner, leaving everything on the measurement side untouched.
+
+## References
+
+1. Guan et al. (2025). [Monitoring Monitorability](https://arxiv.org/abs/2512.18311). arXiv:2512.18311.
+2. [openai/monitorability-evals](https://github.com/openai/monitorability-evals): the official eval scaffold this repo drives.
+3. [confessions-small-scale](https://github.com/abhishuoza/confessions-small-scale): the other half of the thesis, a small-open-scale study of OpenAI's confessions training.
